@@ -1,0 +1,1 @@
+pub struct NullLoggerFactory; pub struct NullLogger; impl NullLoggerFactory { pub fn NewLogger(&self,_:&str)->NullLogger{NullLogger} } impl NullLogger { pub fn Trace(&self,_:&str){} pub fn Debug(&self,_:&str){} pub fn Info(&self,_:&str){} pub fn Warn(&self,_:&str){} pub fn Error(&self,_:&str){} }
