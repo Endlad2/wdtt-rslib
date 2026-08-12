@@ -20,23 +20,11 @@ env:
 
 jobs:
   # ============================================================
-  # Windows
+  # Windows (только x86_64)
   # ============================================================
   build-windows:
-    name: Windows (${{ matrix.arch }})
+    name: Windows (x86_64)
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x86_64, aarch64, i686]
-        include:
-          - arch: x86_64
-            target: x86_64-pc-windows-msvc
-          - arch: aarch64
-            target: aarch64-pc-windows-msvc
-          - arch: i686
-            target: i686-pc-windows-msvc
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -44,53 +32,23 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
       
       - name: Build (Release)
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target x86_64-pc-windows-msvc
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wdtt-client-windows-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/wdtt-rslib.exe
+          name: wdtt-client-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/wdtt-rslib.exe
 
   # ============================================================
-  # Linux
+  # Linux (только x86_64)
   # ============================================================
   build-linux:
-    name: Linux (${{ matrix.arch }})
+    name: Linux (x86_64)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x86_64, aarch64, armv7, i686]
-        include:
-          - arch: x86_64
-            target: x86_64-unknown-linux-gnu
-            gcc_package: ""
-            binutils_package: ""
-            cc: ""
-            ar: ""
-          - arch: aarch64
-            target: aarch64-unknown-linux-gnu
-            gcc_package: gcc-aarch64-linux-gnu
-            binutils_package: binutils-aarch64-linux-gnu
-            cc: aarch64-linux-gnu-gcc
-            ar: aarch64-linux-gnu-ar
-          - arch: armv7
-            target: armv7-unknown-linux-gnueabihf
-            gcc_package: gcc-arm-linux-gnueabihf
-            binutils_package: binutils-arm-linux-gnueabihf
-            cc: arm-linux-gnueabihf-gcc
-            ar: arm-linux-gnueabihf-ar
-          - arch: i686
-            target: i686-unknown-linux-gnu
-            gcc_package: gcc-i686-linux-gnu
-            binutils_package: binutils-i686-linux-gnu
-            cc: i686-linux-gnu-gcc
-            ar: i686-linux-gnu-ar
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -98,31 +56,19 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation dependencies (if needed)
-        if: matrix.gcc_package != ''
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.gcc_package }} ${{ matrix.binutils_package }}
-
-      - name: Set up environment for cross-compilation (if needed)
-        if: matrix.cc != ''
-        run: |
-          echo "CC_${{ matrix.target }}=${{ matrix.cc }}" >> $GITHUB_ENV
-          echo "AR_${{ matrix.target }}=${{ matrix.ar }}" >> $GITHUB_ENV
+          targets: x86_64-unknown-linux-gnu
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target x86_64-unknown-linux-gnu
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wdtt-client-linux-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/wdtt-rslib
+          name: wdtt-client-linux-x86_64
+          path: target/x86_64-unknown-linux-gnu/release/wdtt-rslib
 
   # ============================================================
-  # macOS
+  # macOS (Intel + Apple Silicon)
   # ============================================================
   build-macos:
     name: macOS (${{ matrix.arch }})
@@ -134,8 +80,10 @@ jobs:
         include:
           - arch: x86_64
             target: x86_64-apple-darwin
+            label: intel
           - arch: aarch64
             target: aarch64-apple-darwin
+            label: apple-silicon
     
     steps:
       - name: Checkout code
@@ -152,7 +100,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wdtt-client-macos-${{ matrix.arch }}
+          name: wdtt-client-macos-${{ matrix.label }}
           path: target/${{ matrix.target }}/release/wdtt-rslib
 
   # ============================================================
@@ -178,7 +126,6 @@ jobs:
       - name: Generate version tag
         id: version
         run: |
-          # Формат: YYYY.MM.DD.HH.MM
           TAG=$(date +'%Y.%m.%d.%H.%M')
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "name=WDTT Client $TAG" >> $GITHUB_OUTPUT
@@ -188,10 +135,9 @@ jobs:
           mkdir -p release
           cp -r artifacts/* release/
 
-      - name: Create archive with all binaries
+      - name: Create archives
         run: |
           cd release
-          # Создаём архив со всеми бинарниками
           zip -r ../wdtt-client-all-platforms.zip .
           tar -czf ../wdtt-client-all-platforms.tar.gz .
           cd ..
@@ -207,13 +153,13 @@ jobs:
             **Date:** $(date +'%Y-%m-%d %H:%M:%S')
             
             ### Downloads
-            - [wdtt-client-all-platforms.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-all-platforms.zip)
-            - [wdtt-client-all-platforms.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-all-platforms.tar.gz)
+            - [📦 ZIP](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-all-platforms.zip)
+            - [📦 TAR.GZ](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-all-platforms.tar.gz)
             
             ### Included platforms:
-            - Windows (x86_64, ARM64, i686)
-            - Linux (x86_64, ARM64, ARMv7, i686)
-            - macOS (x86_64, ARM64)
+            - Windows (x86_64)
+            - Linux (x86_64)
+            - macOS (Intel, Apple Silicon)
           files: |
             wdtt-client-all-platforms.zip
             wdtt-client-all-platforms.tar.gz
@@ -267,20 +213,10 @@ jobs:
           echo "| Platform | Architecture | Download |" >> LATEST.md
           echo "|----------|--------------|----------|" >> LATEST.md
           
-          # Windows
           echo "| Windows | x86_64 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-windows-x86_64/wdtt-rslib.exe) |" >> LATEST.md
-          echo "| Windows | ARM64 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-windows-aarch64/wdtt-rslib.exe) |" >> LATEST.md
-          echo "| Windows | i686 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-windows-i686/wdtt-rslib.exe) |" >> LATEST.md
-          
-          # Linux
           echo "| Linux | x86_64 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-linux-x86_64/wdtt-rslib) |" >> LATEST.md
-          echo "| Linux | ARM64 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-linux-aarch64/wdtt-rslib) |" >> LATEST.md
-          echo "| Linux | ARMv7 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-linux-armv7/wdtt-rslib) |" >> LATEST.md
-          echo "| Linux | i686 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-linux-i686/wdtt-rslib) |" >> LATEST.md
-          
-          # macOS
-          echo "| macOS | x86_64 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-macos-x86_64/wdtt-rslib) |" >> LATEST.md
-          echo "| macOS | ARM64 (Apple Silicon) | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-macos-aarch64/wdtt-rslib) |" >> LATEST.md
+          echo "| macOS | Intel | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-macos-intel/wdtt-rslib) |" >> LATEST.md
+          echo "| macOS | Apple Silicon | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-macos-apple-silicon/wdtt-rslib) |" >> LATEST.md
           
           echo "" >> LATEST.md
           echo "---" >> LATEST.md
