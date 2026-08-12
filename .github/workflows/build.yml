@@ -169,7 +169,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ============================================================
-  # Обновление LATEST.md
+  # Обновление LATEST.md (только ссылка)
   # ============================================================
   update-latest:
     name: Update LATEST.md
@@ -192,36 +192,12 @@ jobs:
           fi
           echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
 
-      - name: Create/Update LATEST.md
+      - name: Create LATEST.md with only link
         run: |
-          LATEST_TAG="${{ steps.latest.outputs.tag }}"
           REPO="${{ github.repository }}"
+          LATEST_TAG="${{ steps.latest.outputs.tag }}"
           
-          echo "# WDTT Client Latest Release" > LATEST.md
-          echo "" >> LATEST.md
-          echo "**Latest version:** \`$LATEST_TAG\`" >> LATEST.md
-          echo "" >> LATEST.md
-          echo "## Download" >> LATEST.md
-          echo "" >> LATEST.md
-          echo "### All Platforms (Archive)" >> LATEST.md
-          echo "" >> LATEST.md
-          echo "- [📦 Download ZIP](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-all-platforms.zip)" >> LATEST.md
-          echo "- [📦 Download TAR.GZ](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-all-platforms.tar.gz)" >> LATEST.md
-          echo "" >> LATEST.md
-          echo "### Individual Binaries" >> LATEST.md
-          echo "" >> LATEST.md
-          echo "| Platform | Architecture | Download |" >> LATEST.md
-          echo "|----------|--------------|----------|" >> LATEST.md
-          
-          echo "| Windows | x86_64 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-windows-x86_64/wdtt-rslib.exe) |" >> LATEST.md
-          echo "| Linux | x86_64 | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-linux-x86_64/wdtt-rslib) |" >> LATEST.md
-          echo "| macOS | Intel | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-macos-intel/wdtt-rslib) |" >> LATEST.md
-          echo "| macOS | Apple Silicon | [⬇️ Download](https://github.com/${REPO}/releases/download/${LATEST_TAG}/wdtt-client-macos-apple-silicon/wdtt-rslib) |" >> LATEST.md
-          
-          echo "" >> LATEST.md
-          echo "---" >> LATEST.md
-          echo "" >> LATEST.md
-          echo "**Release date:** $(date +'%Y-%m-%d %H:%M:%S UTC')" >> LATEST.md
+          echo "https://github.com/${REPO}/releases/download/${LATEST_TAG}/" > LATEST.md
 
       - name: Commit and push LATEST.md
         run: |
