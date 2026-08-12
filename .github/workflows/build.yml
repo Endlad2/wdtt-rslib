@@ -166,36 +166,43 @@ jobs:
 
       - name: Create individual ZIP archives
         run: |
-          # Создаём папку для архивации
+          # Очищаем старые папки
+          rm -rf release release_all
           mkdir -p release
+          mkdir -p release_all
           
           # Проходим по всем артефактам
           for dir in artifacts/*; do
             if [ -d "$dir" ]; then
               name=$(basename "$dir")
               # Находим файл внутри папки (бинарник)
-              file=$(find "$dir" -type f -name "wdtt-rslib*" | head -n 1)
+              file=$(find "$dir" -type f \( -name "wdtt-rslib*" -o -name "*.exe" \) | head -n 1)
               if [ -f "$file" ]; then
                 # Определяем расширение для Windows
-                if [[ "$name" == *"windows"* ]]; then
+                if [[ "$name" == *"windows"* ]] || [[ "$file" == *.exe ]]; then
                   filename="wdtt-rslib.exe"
                 else
                   filename="wdtt-rslib"
                 fi
-                # Копируем в папку release с правильным именем
+                # Копируем в папку release для индивидуального архива
                 cp "$file" "release/$filename"
-                # Создаём ZIP-архив
                 cd release
                 zip -r "../${name}.zip" "$filename"
                 cd ..
-                # Удаляем временный файл
                 rm "release/$filename"
+                
+                # Копируем в папку release_all для общего архива
+                if [[ "$name" == *"windows"* ]] || [[ "$file" == *.exe ]]; then
+                  cp "$file" "release_all/${name}.exe"
+                else
+                  cp "$file" "release_all/${name}"
+                fi
               fi
             fi
           done
           
           # Создаём общий архив со всеми бинарниками
-          cd release
+          cd release_all
           zip -r ../wdtt-client-all-platforms.zip .
           tar -czf ../wdtt-client-all-platforms.tar.gz .
           cd ..
