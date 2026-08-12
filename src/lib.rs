@@ -6,6 +6,8 @@ pub mod captcha_v2_slider;
 pub mod creds_vkcalls;
 pub mod dispatcher;
 pub mod dns;
+// src/lib.rs
+pub mod config;
 pub mod events;
 pub mod logger;
 pub mod namegen;
