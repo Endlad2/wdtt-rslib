@@ -66,7 +66,7 @@ cargo build --release
 | Платформа | Артефакт |
 | --- | --- |
 | Linux x86_64 (glibc) | `wdtt-core-linux-x86_64` |
-| Linux musl (x86_64, aarch64, armv7, mips, mipsel) | `wdtt-openwrt-*` |
+| Linux musl (x86_64, aarch64, armv7) | `wdtt-openwrt-*` |
 | Windows x86_64 | `wdtt-core-windows-x86_64.exe` |
 | macOS (universal) | `wdtt-core-macos-universal` |
 | Android (arm64-v8a, armeabi-v7a, x86_64) | `wdtt-android-multiabi.zip` (`jniLibs/*/libwdtt.so`) |
@@ -177,6 +177,10 @@ HKDF), RTP-заголовки, диспетчер на реальных UDP-со
   на Android/iOS интерфейс создаёт host-приложение и передаёт fd.
 * На Windows рядом с `wdtt-rslib.exe` нужен `wintun.dll` (как и для любого
   WireGuard-клиента).
+* Android собирается под **API 24+**: `getifaddrs`/`freeifaddrs` появились
+  только в API 24, на API 21 линковка падает.
+* mips/mipsel не собираются: для них нет готового `rust-std` (tier-3),
+  нужна сборка std из исходников. На таких роутерах WDTToR пока недоступен.
 
 ## Лицензия
 

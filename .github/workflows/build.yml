@@ -228,7 +228,11 @@ jobs:
         run: |
           set -euo pipefail
           TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
-          API=21
+          # API 24 is the minimum: getifaddrs/freeifaddrs (used by nix through
+          # webrtc-util) only exist from API 24, so an API 21 build fails at
+          # link time with "undefined symbol: getifaddrs". It also matches the
+          # LaLune Android minSdk.
+          API=24
           build() {
             local target="$1" abi="$2" cc_prefix="$3"
             local cc="${TOOLCHAIN}/bin/${cc_prefix}${API}-clang"
@@ -242,7 +246,16 @@ jobs:
             export "CARGO_TARGET_$(echo "$var" | tr '[:lower:]' '[:upper:]')_LINKER=${cc}"
 
             echo "--- $target (CC=${cc})"
-            cargo build --release --locked --target "$target"
+            if ! cargo build --release --locked --target "$target" 2> "build-$target.log"; then
+              python3 - "$target" "build-$target.log" <<'PY'
+          import pathlib, sys
+          target, path = sys.argv[1], sys.argv[2]
+          text = pathlib.Path(path).read_text(errors="replace")
+          lines = [l for l in text.splitlines() if "error" in l.lower()][:40] or text.splitlines()[-40:]
+          print(f"::error title=android {target} failed::" + "\n".join(lines).replace("%", "%25").replace("\n", "%0A")[:60000])
+          PY
+              exit 1
+            fi
 
             # Android packages executables as .so files inside jniLibs: the app
             # launches them from nativeLibraryDir with ProcessBuilder, exactly
