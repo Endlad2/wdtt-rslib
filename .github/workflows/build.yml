@@ -1,18 +1,15 @@
-name: Build and Release WDTT Client
+name: Build and Release WDTToR
 
 on:
   push:
-    branches: [ main, master ]
-    tags:
-      - 'v*'
+    branches: [main, master]
+    tags: ["v*"]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
   contents: write
-  actions: write
-  checks: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,269 +17,292 @@ env:
 
 jobs:
   # ============================================================
-  # Windows (только x86_64)
+  #  Проверки: форматирование, clippy, тесты
   # ============================================================
-  build-windows:
-    name: Windows (x86_64)
-    runs-on: windows-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-      
-      - name: Build (Release)
-        run: cargo build --release --target x86_64-pc-windows-msvc
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wdtt-client-windows-x86_64
-          path: target/x86_64-pc-windows-msvc/release/wdtt-rslib.exe
-
-  # ============================================================
-  # Linux (только x86_64)
-  # ============================================================
-  build-linux:
-    name: Linux (x86_64)
+  check:
+    name: Check & test
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          components: rustfmt, clippy
 
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - uses: Swatinem/rust-cache@v2
 
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets --verbose
+
+  # ============================================================
+  #  Linux (glibc, для desktop-клиента)
+  # ============================================================
+  build-linux:
+    name: Linux x86_64
+    needs: check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --target x86_64-unknown-linux-gnu
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        run: cargo build --release --locked
+      - name: Stage
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/wdtt-rslib dist/wdtt-core-linux-x86_64
+          strip dist/wdtt-core-linux-x86_64 || true
+          ls -la dist
+      - uses: actions/upload-artifact@v4
         with:
-          name: wdtt-client-linux-x86_64
-          path: target/x86_64-unknown-linux-gnu/release/wdtt-rslib
+          name: wdtt-linux-x86_64
+          path: dist/wdtt-core-linux-x86_64
+          if-no-files-found: error
 
   # ============================================================
-  # macOS (Intel + Apple Silicon)
+  #  Linux static (musl) — для роутеров и старых дистрибутивов
   # ============================================================
-  build-macos:
-    name: macOS (${{ matrix.arch }})
-    runs-on: macos-latest
+  build-linux-musl:
+    name: Linux musl ${{ matrix.arch }}
+    needs: check
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
         include:
           - arch: x86_64
-            target: x86_64-apple-darwin
-            label: intel
+            target: x86_64-unknown-linux-musl
+            asset: wdtt-openwrt-x86_64
           - arch: aarch64
-            target: aarch64-apple-darwin
-            label: apple-silicon
-    
+            target: aarch64-unknown-linux-musl
+            asset: wdtt-openwrt-aarch64
+          - arch: armv7
+            target: armv7-unknown-linux-musleabihf
+            asset: wdtt-openwrt-armv7
+          - arch: mips
+            target: mips-unknown-linux-musl
+            asset: wdtt-openwrt-mips
+          - arch: mipsel
+            target: mipsel-unknown-linux-musl
+            asset: wdtt-openwrt-mipsel
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.arch }}-cargo-
-            ${{ runner.os }}-cargo-
-
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross linker
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+      - name: Configure linker
+        run: |
+          set -euo pipefail
+          mkdir -p .cargo
+          {
+            echo "[target.${{ matrix.target }}]"
+            case "${{ matrix.target }}" in
+              aarch64-*) echo "linker = \"aarch64-linux-gnu-gcc\"" ;;
+              armv7-*)   echo "linker = \"arm-linux-gnueabihf-gcc\"" ;;
+            esac
+          } >> .cargo/config.toml
+          cat .cargo/config.toml
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Stage
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/wdtt-rslib" "dist/${{ matrix.asset }}"
+          strip "dist/${{ matrix.asset }}" || true
+          file "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
         with:
-          name: wdtt-client-macos-${{ matrix.label }}
-          path: target/${{ matrix.target }}/release/wdtt-rslib
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
 
   # ============================================================
-  # Сборка всех артефактов в отдельные ZIP-архивы
+  #  Windows
   # ============================================================
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    needs: [build-windows, build-linux, build-macos]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
-    
+  build-windows:
+    name: Windows x86_64
+    needs: check
+    runs-on: windows-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          fetch-depth: 0
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/wdtt-rslib.exe dist/wdtt-core-windows-x86_64.exe
+          ls -la dist
+      - uses: actions/upload-artifact@v4
         with:
-          path: artifacts
+          name: wdtt-windows-x86_64
+          path: dist/wdtt-core-windows-x86_64.exe
+          if-no-files-found: error
 
-      - name: Generate version tag
+  # ============================================================
+  #  macOS (universal)
+  # ============================================================
+  build-macos:
+    name: macOS universal
+    needs: check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both slices
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+      - name: Lip into a universal binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          lipo -create \
+            target/x86_64-apple-darwin/release/wdtt-rslib \
+            target/aarch64-apple-darwin/release/wdtt-rslib \
+            -output dist/wdtt-core-macos-universal
+          chmod +x dist/wdtt-core-macos-universal
+          file dist/wdtt-core-macos-universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wdtt-macos-universal
+          path: dist/wdtt-core-macos-universal
+          if-no-files-found: error
+
+  # ============================================================
+  #  Android (libwdtt.so для jniLibs, 3 ABI в одном zip)
+  # ============================================================
+  build-android:
+    name: Android multi-ABI
+    needs: check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Android NDK
+        run: |
+          set -euo pipefail
+          NDK_VERSION=r27c
+          curl -fsSL --retry 3 -o /tmp/ndk.zip \
+            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          unzip -q /tmp/ndk.zip -d "$HOME"
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+      - name: Build per ABI
+        run: |
+          set -euo pipefail
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          build() {
+            local target="$1" abi="$2" cc="$3"
+            mkdir -p ".cargo"
+            cat >> .cargo/config.toml <<EOF
+          [target.${target}]
+          linker = "${TOOLCHAIN}/bin/${cc}"
+          rustflags = ["-C", "link-arg=-Wl,--build-id=sha1"]
+          EOF
+            cargo build --release --locked --target "$target"
+            # Android packages executables as .so files inside jniLibs: the app
+            # launches them from nativeLibraryDir with ProcessBuilder, exactly
+            # like the reference WDTT client does.
+            mkdir -p "dist/jniLibs/${abi}"
+            cp "target/${target}/release/wdtt-rslib" "dist/jniLibs/${abi}/libwdtt.so"
+            chmod +x "dist/jniLibs/${abi}/libwdtt.so"
+          }
+          build aarch64-linux-android     arm64-v8a   aarch64-linux-android21-clang
+          build armv7-linux-androideabi   armeabi-v7a armv7a-linux-androideabi21-clang
+          build x86_64-linux-android      x86_64      x86_64-linux-android21-clang
+          find dist/jniLibs -type f -exec ls -la {} \;
+      - name: Pack
+        run: |
+          set -euo pipefail
+          ( cd dist && zip -qry wdtt-android-multiabi.zip jniLibs )
+          ls -la dist/wdtt-android-multiabi.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wdtt-android-multiabi
+          path: dist/wdtt-android-multiabi.zip
+          if-no-files-found: error
+
+  # ============================================================
+  #  Release
+  # ============================================================
+  release:
+    name: Publish release
+    needs: [build-linux, build-linux-musl, build-windows, build-macos, build-android]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute version and stamp LATEST
         id: version
         run: |
-          TAG=$(date +'%Y.%m.%d.%H.%M')
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "name=WDTT Client $TAG" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(date -u +%Y.%m.%d.%H.%M)-$(git rev-parse --short=7 HEAD)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "$VERSION" > LATEST
+          ls -la dist
+          sha256sum dist/* || true
 
-      - name: Create individual ZIP archives
-        run: |
-          # Очищаем старые папки
-          rm -rf release release_all
-          mkdir -p release
-          mkdir -p release_all
-          
-          # Проходим по всем артефактам
-          for dir in artifacts/*; do
-            if [ -d "$dir" ]; then
-              name=$(basename "$dir")
-              # Находим файл внутри папки (бинарник)
-              file=$(find "$dir" -type f \( -name "wdtt-rslib*" -o -name "*.exe" \) | head -n 1)
-              if [ -f "$file" ]; then
-                # Определяем расширение для Windows
-                if [[ "$name" == *"windows"* ]] || [[ "$file" == *.exe ]]; then
-                  filename="wdtt-rslib.exe"
-                else
-                  filename="wdtt-rslib"
-                fi
-                # Копируем в папку release для индивидуального архива
-                cp "$file" "release/$filename"
-                cd release
-                zip -r "../${name}.zip" "$filename"
-                cd ..
-                rm "release/$filename"
-                
-                # Копируем в папку release_all для общего архива
-                if [[ "$name" == *"windows"* ]] || [[ "$file" == *.exe ]]; then
-                  cp "$file" "release_all/${name}.exe"
-                else
-                  cp "$file" "release_all/${name}"
-                fi
-              fi
-            fi
-          done
-          
-          # Создаём общий архив со всеми бинарниками
-          cd release_all
-          zip -r ../wdtt-client-all-platforms.zip .
-          tar -czf ../wdtt-client-all-platforms.tar.gz .
-          cd ..
-
-      - name: List all archives
-        run: |
-          echo "=== Созданные архивы ==="
-          ls -la *.zip
-          ls -la *.tar.gz
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+      - name: Publish
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ${{ steps.version.outputs.name }}
-          body: |
-            ## WDTT Client Release
-            
-            **Date:** $(date +'%Y-%m-%d %H:%M:%S')
-            
-            ### Downloads
-            - [📦 ZIP (All Platforms)](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-all-platforms.zip)
-            - [📦 TAR.GZ (All Platforms)](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-all-platforms.tar.gz)
-            
-            ### Individual Downloads
-            | Platform | Download |
-            |----------|----------|
-            | Windows (x86_64) | [⬇️ Download](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-windows-x86_64.zip) |
-            | Linux (x86_64) | [⬇️ Download](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-linux-x86_64.zip) |
-            | macOS (Intel) | [⬇️ Download](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-macos-intel.zip) |
-            | macOS (Apple Silicon) | [⬇️ Download](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/wdtt-client-macos-apple-silicon.zip) |
+          tag_name: ${{ steps.version.outputs.version }}
+          name: WDTToR ${{ steps.version.outputs.version }}
           files: |
-            wdtt-client-windows-x86_64.zip
-            wdtt-client-linux-x86_64.zip
-            wdtt-client-macos-intel.zip
-            wdtt-client-macos-apple-silicon.zip
-            wdtt-client-all-platforms.zip
-            wdtt-client-all-platforms.tar.gz
+            dist/wdtt-core-linux-x86_64
+            dist/wdtt-core-windows-x86_64.exe
+            dist/wdtt-core-macos-universal
+            dist/wdtt-android-multiabi.zip
+            dist/wdtt-openwrt-x86_64
+            dist/wdtt-openwrt-aarch64
+            dist/wdtt-openwrt-armv7
+            dist/wdtt-openwrt-mips
+            dist/wdtt-openwrt-mipsel
+          fail_on_unmatched_files: false
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: true
 
-  # ============================================================
-  # Обновление LATEST.md (только ссылка)
-  # ============================================================
-  update-latest:
-    name: Update LATEST.md
-    runs-on: ubuntu-latest
-    needs: [create-release]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Get latest tag
-        id: latest
+      - name: Update LATEST on the branch
         run: |
-          LATEST_TAG=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name)
-          if [ "$LATEST_TAG" == "null" ] || [ -z "$LATEST_TAG" ]; then
-            LATEST_TAG="${{ needs.create-release.outputs.tag }}"
-          fi
-          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-
-      - name: Create LATEST.md with only link
-        run: |
-          REPO="${{ github.repository }}"
-          LATEST_TAG="${{ steps.latest.outputs.tag }}"
-          
-          echo "https://github.com/${REPO}/releases/download/${LATEST_TAG}/" > LATEST.md
-
-      - name: Commit and push LATEST.md
-        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add LATEST.md
-          git commit -m "Update LATEST.md to latest release ${{ steps.latest.outputs.tag }}" || echo "No changes to commit"
-          git push origin HEAD:main || git push origin HEAD:master
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add LATEST
+          git commit -m "chore: LATEST → ${{ steps.version.outputs.version }} [skip ci]" || exit 0
+          git push

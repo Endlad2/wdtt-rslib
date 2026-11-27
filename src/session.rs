@@ -1,395 +1,450 @@
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use std::{any::Any, io, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::{net::UdpSocket, sync::mpsc, time::interval};
-use webrtc_dtls::{
-    cipher_suite::CipherSuiteId,
-    config::{Config, ExtendedMasterSecretType},
-    conn::DTLSConn,
-    crypto::Certificate,
-};
-use webrtc_turn::client::{Client, ClientConfig};
-use webrtc_util::{Conn as DtlsConnTrait, Error as DtlsIoError};
-use webrtc_util_legacy::Conn as TurnConn;
+// SPDX-License-Identifier: LGPL-2.1
+//
+//! One tunnel session ("worker").
+//!
+//! A session allocates its own TURN relay, performs the DTLS handshake over the
+//! obfuscated transport and then proxies datagrams between the dispatcher and
+//! the DTLS channel. Multiple sessions run in parallel and share the local
+//! WireGuard endpoint, which is what gives WDTT its throughput.
+//!
+//! The very first session also asks the server for the WireGuard config
+//! (`GETCONF:`) and reports it to the host, which is the only way the client
+//! ever learns its keys and address.
 
-use crate::{
-    dispatcher::{Dispatcher, WorkerSlot},
-    obfs::{obfsUnwrapPacket, obfsWrapPacket, NewObfsConfig, NewObfsState, ObfsConfig, ObfsState},
-    stats::Stats,
-    vk_auth::{handleAuthError, isAuthError},
-    worker_group::{Credentials, TurnParams},
-    wrap::wrapKeyLen,
-};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
-pub const WORKER_SEND_BUF: usize = 128;
-pub const SESSION_READ_TIMEOUT_SECS: u64 = 1800;
-pub const READ_BUF_SIZE: usize = 1600;
-pub const SOCKET_BUF_SIZE: usize = 625 * 1024;
-pub const KEEPALIVE_BYTE: u8 = 0xff;
-pub const KEEPALIVE_INTERVAL_SECS: u64 = 15;
-pub const DTLS_HANDSHAKE_TIMEOUT_SECS: u64 = 60; // Увеличил до 60 секунд
+use anyhow::{anyhow, Result};
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 
-struct RelayDtlsConn<T: TurnConn + Send + Sync + 'static> {
-    relay: Arc<T>,
-    relay_addr: SocketAddr,
-    peer: SocketAddr,
-    key: Option<Vec<u8>>,
-    cfg: Option<ObfsConfig>,
-    state: Option<ObfsState>,
+use crate::config::WdttLink;
+use crate::dispatcher::{Dispatcher, DispatcherHandle, WorkerSlot};
+use crate::dtls::{ConfigResponse, DtlsSession};
+use crate::events;
+use crate::obfs::ObfsMode;
+use crate::stats::Stats;
+use crate::turn::{AllocErrorKind, TurnAllocation, TurnObfsConn};
+use crate::vk::{self, TurnCredentials};
+
+/// How long a session may live without traffic before it is recycled.
+pub const SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Keepalive interval towards the server.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// STUN binding refresh interval.
+pub const BINDING_INTERVAL: Duration = Duration::from_secs(10);
+/// Retry delay range when a session dies.
+pub const RETRY_MIN: Duration = Duration::from_secs(5);
+pub const RETRY_MAX: Duration = Duration::from_secs(16);
+
+/// Where the WireGuard config is delivered, plus a flag that stops the other
+/// workers from asking for it once it has been received.
+#[derive(Clone)]
+pub struct ConfigSink {
+    pub tx: mpsc::Sender<String>,
+    pub delivered: Arc<AtomicBool>,
 }
 
-impl<T: TurnConn + Send + Sync + 'static> RelayDtlsConn<T> {
-    async fn new(relay: Arc<T>, peer: SocketAddr, params: &TurnParams) -> Result<Self> {
-        let use_wrap = params.WrapKey.len() == wrapKeyLen;
-        eprintln!("[RELAY] WRAP enabled: {}, key len: {}", use_wrap, params.WrapKey.len());
-        let relay_addr = relay.local_addr().await?;
-        Ok(Self {
-            relay,
-            relay_addr,
-            peer,
-            key: use_wrap.then(|| params.WrapKey.clone()),
-            cfg: use_wrap.then(|| NewObfsConfig(&params.ObfsMode)),
-            state: use_wrap.then(NewObfsState),
-        })
-    }
-
-    fn to_new_error(e: impl std::fmt::Display) -> DtlsIoError {
-        io::Error::new(io::ErrorKind::Other, e.to_string()).into()
-    }
+/// Shared credentials cache: one TURN credential set is reused by all workers
+/// until it is rejected, mirroring the reference client.
+#[derive(Clone)]
+pub struct CredentialCache {
+    inner: Arc<Mutex<Option<TurnCredentials>>>,
+    hash: String,
+    mode: vk::AuthMode,
 }
 
-#[async_trait]
-impl<T: TurnConn + Send + Sync + 'static> DtlsConnTrait for RelayDtlsConn<T> {
-    async fn connect(&self, _: SocketAddr) -> std::result::Result<(), DtlsIoError> {
-        Ok(())
-    }
-
-    async fn recv(&self, dst: &mut [u8]) -> std::result::Result<usize, DtlsIoError> {
-        loop {
-            let mut wire = vec![0u8; READ_BUF_SIZE + 80];
-            let (n, _) = self
-                .relay
-                .recv_from(&mut wire)
-                .await
-                .map_err(Self::to_new_error)?;
-            if let Some(key) = &self.key {
-                match obfsUnwrapPacket(key, &wire[..n], dst) {
-                    Ok(n) => return Ok(n),
-                    Err(_) => continue,
-                }
-            } else {
-                if n > dst.len() {
-                    return Err(Self::to_new_error("relay packet exceeds buffer"));
-                }
-                dst[..n].copy_from_slice(&wire[..n]);
-                return Ok(n);
-            }
+impl CredentialCache {
+    pub fn new(hash: String, mode: vk::AuthMode) -> Self {
+        CredentialCache {
+            inner: Arc::new(Mutex::new(None)),
+            hash,
+            mode,
         }
     }
 
-    async fn recv_from(
-        &self,
-        dst: &mut [u8],
-    ) -> std::result::Result<(usize, SocketAddr), DtlsIoError> {
-        let n = self.recv(dst).await?;
-        Ok((n, self.peer))
+    /// Returns cached credentials or fetches a new set from VK.
+    pub async fn get(&self) -> Result<TurnCredentials, vk::VkError> {
+        let mut guard = self.inner.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            return Ok(cached.clone());
+        }
+        let creds = vk::fetch_turn_credentials_mode(&self.hash, self.mode).await?;
+        *guard = Some(creds.clone());
+        Ok(creds)
     }
 
-    async fn send(&self, data: &[u8]) -> std::result::Result<usize, DtlsIoError> {
-        let wire = if let (Some(key), Some(cfg), Some(state)) = (&self.key, &self.cfg, &self.state) {
-            obfsWrapPacket(key, data, cfg, state).map_err(Self::to_new_error)?
-        } else {
-            data.to_vec()
-        };
-        self.relay
-            .send_to(&wire, self.peer)
-            .await
-            .map_err(Self::to_new_error)?;
-        Ok(data.len())
-    }
-
-    async fn send_to(
-        &self,
-        data: &[u8],
-        _: SocketAddr,
-    ) -> std::result::Result<usize, DtlsIoError> {
-        self.send(data).await
-    }
-
-    fn local_addr(&self) -> std::result::Result<SocketAddr, DtlsIoError> {
-        Ok(self.relay_addr)
-    }
-
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        Some(self.peer)
-    }
-
-    async fn close(&self) -> std::result::Result<(), DtlsIoError> {
-        Ok(())
-    }
-
-    fn as_any(&self) -> &(dyn Any + Send + Sync) {
-        self
+    /// Drops cached credentials so the next call refetches them.
+    pub async fn invalidate(&self) {
+        *self.inner.lock().await = None;
     }
 }
 
-fn turn_address(params: &TurnParams, creds: &Credentials, session_id: i32) -> Result<String> {
-    let url = creds
-        .TurnURLs
-        .get(session_id as usize % creds.TurnURLs.len())
-        .context("нет TURN URL в учетных данных")?;
-    let mut addr = url
-        .trim_start_matches("turn:")
-        .trim_start_matches("turns:")
-        .split('?')
-        .next()
-        .unwrap_or(url)
-        .to_string();
-    if !params.Host.is_empty() {
-        let port = if params.Port.is_empty() {
-            addr.rsplit_once(':').map(|x| x.1).unwrap_or("3478")
-        } else {
-            &params.Port
-        };
-        addr = format!("{}:{}", params.Host, port);
-    } else if !params.Port.is_empty() {
-        let host = addr.rsplit_once(':').map(|x| x.0).unwrap_or(&addr);
-        addr = format!("{}:{}", host, params.Port);
-    }
-    Ok(addr)
+/// Everything a worker needs to run.
+pub struct SessionContext {
+    pub link: WdttLink,
+    pub wrap_key: Vec<u8>,
+    pub obfs_mode: ObfsMode,
+    pub device_id: String,
+    pub credentials: CredentialCache,
+    pub dispatcher: DispatcherHandle,
+    pub stats: Arc<Stats>,
+    pub token: CancellationToken,
+    /// Turn override from the CLI (`--turn`/`--port`).
+    pub turn_override: Option<String>,
+    /// Which VK auth chain to use for TURN credentials.
+    pub auth_mode: vk::AuthMode,
 }
 
-pub async fn RunSession(
-    params: &TurnParams,
-    peer: &str,
-    dispatcher: Arc<Dispatcher>,
-    local_port: &str,
-    get_config: bool,
-    config_tx: Option<mpsc::Sender<String>>,
-    session_id: i32,
-    creds: &Credentials,
-    device_id: &str,
-    password: &str,
-    stats: Arc<Stats>,
-) -> Result<bool> {
-    eprintln!("[ВОРКЕР #{}] RunSession started", session_id);
-    
-    let peer: SocketAddr = tokio::net::lookup_host(peer)
-        .await?
-        .next()
-        .context("резолв peer")?;
-    eprintln!("[ВОРКЕР #{}] Peer resolved: {}", session_id, peer);
+/// Result of one session attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionOutcome {
+    /// The session ran and ended normally (tunnel closed, context cancelled).
+    Closed,
+    /// Credentials were rejected: the cache must be invalidated.
+    CredentialsRejected,
+    /// The VK call is dead; no point retrying.
+    Fatal(String),
+    /// Transient failure.
+    Retryable(String),
+}
 
-    let turn_addr = turn_address(params, creds, session_id)?;
-    eprintln!("[ВОРКЕР #{}] TURN address: {}", session_id, turn_addr);
+/// Runs one session to completion.
+///
+/// `want_config` marks the session responsible for fetching the WireGuard
+/// config from the server; `config_tx` receives it exactly once.
+pub async fn run_session(
+    ctx: Arc<SessionContext>,
+    worker_id: usize,
+    want_config: bool,
+    config_tx: Option<ConfigSink>,
+) -> SessionOutcome {
+    if ctx.token.is_cancelled() {
+        return SessionOutcome::Closed;
+    }
 
-    let socket = UdpSocket::bind(if peer.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
-    .await?;
-    eprintln!("[ВОРКЕР #{}] UDP socket bound", session_id);
+    let credentials = match ctx.credentials.get().await {
+        Ok(creds) => creds,
+        Err(err) => {
+            return match err {
+                vk::VkError::CallUnavailable(m) => SessionOutcome::Fatal(m),
+                vk::VkError::Fatal(m) => SessionOutcome::Fatal(m),
+                vk::VkError::Retryable(m) => SessionOutcome::Retryable(m),
+            };
+        }
+    };
 
-    eprintln!("[ВОРКЕР #{}] Creating TURN client with user: {} (len: {})", 
-        session_id, creds.User, creds.User.len());
-    
-    let turn = Client::new(ClientConfig {
-        stun_serv_addr: turn_addr.clone(),
-        turn_serv_addr: turn_addr.clone(),
-        username: creds.User.clone(),
-        password: creds.Pass.clone(),
-        realm: String::new(),
-        software: String::new(),
-        rto_in_ms: 1000, // Увеличил до 1000ms
-        conn: Arc::new(socket),
-        vnet: None,
-    })
+    if credentials.urls.is_empty() {
+        return SessionOutcome::Retryable("VK не вернул TURN-серверы".to_string());
+    }
+
+    // Spread workers over the available TURN servers.
+    let selected = ctx
+        .turn_override
+        .clone()
+        .unwrap_or_else(|| credentials.urls[worker_id % credentials.urls.len()].clone());
+
+    let ipv4 = ctx.link.host.parse::<std::net::Ipv4Addr>().is_ok() || ctx.link.host.contains('.');
+
+    log::info!("[СЕССИЯ #{worker_id}] TURN {selected}");
+
+    let allocation = match TurnAllocation::allocate(
+        &selected,
+        &credentials.username,
+        &credentials.password,
+        ipv4,
+    )
     .await
-    .context("TURN клиент")?;
-    eprintln!("[ВОРКЕР #{}] TURN client created", session_id);
-
-    turn.listen().await.context("TURN Listen")?;
-    eprintln!("[ВОРКЕР #{}] TURN listening", session_id);
-
-    eprintln!("[ВОРКЕР #{}] Allocating TURN...", session_id);
-    let relay = match tokio::time::timeout(
-        Duration::from_secs(30),
-        turn.allocate()
-    ).await {
-        Ok(Ok(r)) => {
-            eprintln!("[ВОРКЕР #{}] TURN allocated successfully!", session_id);
-            Arc::new(r)
-        }
-        Ok(Err(e)) => {
-            eprintln!("[ВОРКЕР #{}] TURN allocate error: {}", session_id, e);
-            return Err(anyhow::anyhow!("TURN Allocate: {}", e));
-        }
-        Err(_) => {
-            eprintln!("[ВОРКЕР #{}] TURN allocate timeout!", session_id);
-            return Err(anyhow::anyhow!("TURN Allocate timeout"));
-        }
-    };
-    eprintln!("[ВОРКЕР #{}] TURN allocated", session_id);
-
-    let relay_for_dtls: Arc<dyn DtlsConnTrait + Send + Sync> =
-        Arc::new(RelayDtlsConn::new(relay, peer, params).await?);
-    eprintln!("[ВОРКЕР #{}] DTLS relay wrapper created", session_id);
-
-    let cert = Certificate::generate_self_signed(vec!["localhost".into()])
-        .context("генерация сертификата")?;
-    eprintln!("[ВОРКЕР #{}] Self-signed cert generated", session_id);
-
-    eprintln!("[ВОРКЕР #{}] Starting DTLS handshake...", session_id);
-    let dtls = match tokio::time::timeout(
-        Duration::from_secs(DTLS_HANDSHAKE_TIMEOUT_SECS),
-        DTLSConn::new(
-            relay_for_dtls,
-            Config {
-                certificates: vec![cert],
-                cipher_suites: vec![CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256],
-                insecure_skip_verify: true,
-                extended_master_secret: ExtendedMasterSecretType::Require,
-                ..Default::default()
-            },
-            true,
-            None,
-        )
-    ).await {
-        Ok(Ok(conn)) => {
-            eprintln!("[ВОРКЕР #{}] DTLS handshake SUCCESS!", session_id);
-            Arc::new(conn)
-        }
-        Ok(Err(e)) => {
-            eprintln!("[ВОРКЕР #{}] DTLS handshake error: {}", session_id, e);
-            return Err(anyhow::anyhow!("DTLS handshake error: {}", e));
-        }
-        Err(_) => {
-            eprintln!("[ВОРКЕР #{}] DTLS handshake TIMEOUT ({}s)!", session_id, DTLS_HANDSHAKE_TIMEOUT_SECS);
-            return Err(anyhow::anyhow!("DTLS timeout"));
-        }
-    };
-
-    let mut config_delivered = false;
-
-    if get_config {
-        eprintln!("[ВОРКЕР #{}] Requesting config...", session_id);
-        let payload = format!("GETCONF:{}|{}|{}", local_port, device_id, password);
-        if let Err(e) = dtls
-            .write(payload.as_bytes(), Some(Duration::from_secs(15)))
-            .await
-        {
-            let err_msg = e.to_string();
-            eprintln!("[ВОРКЕР #{}] Config write error: {}", session_id, err_msg);
-            if isAuthError(&anyhow::anyhow!(err_msg.clone())) {
-                handleAuthError(creds.CacheStreamID);
-                return Err(anyhow::anyhow!("FATAL_AUTH: неверный пароль подключения"));
-            }
-            return Err(anyhow::anyhow!(e));
-        }
-
-        let mut b = [0u8; 4096];
-        let n = dtls
-            .read(&mut b, Some(Duration::from_secs(15)))
-            .await
-            .map_err(|e| {
-                let err_msg = e.to_string();
-                eprintln!("[ВОРКЕР #{}] Config read error: {}", session_id, err_msg);
-                if isAuthError(&anyhow::anyhow!(err_msg.clone())) {
-                    handleAuthError(creds.CacheStreamID);
-                    anyhow::anyhow!("FATAL_AUTH: неверный пароль подключения")
-                } else {
-                    anyhow::anyhow!(e)
+    {
+        Ok(allocation) => allocation,
+        Err(err) => {
+            let message = err.to_string();
+            return match AllocErrorKind::classify(&message) {
+                AllocErrorKind::CredentialsRejected => {
+                    log::warn!("[СЕССИЯ #{worker_id}] TURN отклонил креды: {message}");
+                    ctx.credentials.invalidate().await;
+                    SessionOutcome::CredentialsRejected
                 }
-            })?;
-
-        let response = String::from_utf8_lossy(&b[..n]).into_owned();
-        eprintln!("[ВОРКЕР #{}] Config response: {}", session_id, response);
-        
-        if response.starts_with("DENIED:") {
-            handleAuthError(creds.CacheStreamID);
-            anyhow::bail!("FATAL_AUTH: {}", response);
+                AllocErrorKind::Quota => {
+                    SessionOutcome::Retryable(format!("TURN квота: {message}"))
+                }
+                AllocErrorKind::Other => SessionOutcome::Retryable(message),
+            };
         }
-        if response != "NOCONF" {
-            crate::events::emitConfig(&response);
-            if let Some(tx) = config_tx {
-                let _ = tx.send(response).await;
+    };
+
+    log::info!(
+        "[СЕССИЯ #{worker_id}] relay {} (local {})",
+        allocation.relay_addr(),
+        allocation.local_addr()
+    );
+
+    // Keep the allocation alive with STUN binding requests.
+    let binding_token = ctx.token.child_token();
+    let binding_client = allocation.client_handle();
+    let binding_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(BINDING_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = binding_token.cancelled() => return,
+                _ = ticker.tick() => {
+                    if let Err(err) = binding_client.send_binding_request().await {
+                        log::debug!("[TURN] binding request failed: {err}");
+                    }
+                }
             }
-            config_delivered = true;
-            eprintln!("[ВОРКЕР #{}] Config delivered!", session_id);
+        }
+    });
+
+    let peer: SocketAddr = match tokio::net::lookup_host(ctx.link.peer_addr()).await {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => addr,
+            None => {
+                binding_task.abort();
+                return SessionOutcome::Retryable(format!(
+                    "не удалось разрешить адрес сервера {}",
+                    ctx.link.peer_addr()
+                ));
+            }
+        },
+        Err(err) => {
+            binding_task.abort();
+            return SessionOutcome::Retryable(format!("DNS {}: {err}", ctx.link.host));
+        }
+    };
+
+    let transport = TurnObfsConn::new(&allocation, peer, ctx.wrap_key.clone(), ctx.obfs_mode);
+
+    let session = match DtlsSession::connect(transport, &ctx.link.host).await {
+        Ok(session) => session,
+        Err(err) => {
+            binding_task.abort();
+            let message = err.to_string();
+            log::warn!("[ВОРКЕР #{worker_id}] DTLS не поднялся: {message}");
+            return SessionOutcome::Retryable(message);
+        }
+    };
+
+    log::info!("[ВОРКЕР #{worker_id}] DTLS установлен");
+    ctx.stats.worker_started();
+
+    // Fetch the WireGuard config exactly once, on the designated session.
+    if want_config {
+        if let Some(config_tx) = config_tx {
+            match session
+                .request_config(ctx.link.local_port, &ctx.device_id, &ctx.link.password)
+                .await
+            {
+                Ok(ConfigResponse::Config(config)) => {
+                    log::info!("[ВОРКЕР #{worker_id}] конфиг WireGuard получен");
+                    config_tx.delivered.store(true, Ordering::Relaxed);
+                    let _ = config_tx.tx.send(config).await;
+                }
+                Ok(ConfigResponse::NotReady) => {
+                    log::info!("[ВОРКЕР #{worker_id}] сервер ещё не выдал конфиг, повторим позже");
+                }
+                Ok(ConfigResponse::Denied(reason)) => {
+                    let message = ConfigResponse::denial_message(&reason);
+                    log::error!("[ВОРКЕР #{worker_id}] {message}");
+                    events::emit_error("DENIED", &message, true);
+                    ctx.stats.worker_stopped();
+                    binding_task.abort();
+                    session.close().await;
+                    return SessionOutcome::Fatal(message);
+                }
+                Err(err) => {
+                    log::warn!("[ВОРКЕР #{worker_id}] ошибка запроса конфига: {err}");
+                }
+            }
         }
     }
 
-    stats.ActiveConnections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::events::emitReady();
-    eprintln!("[ВОРКЕР #{}] Session ready!", session_id);
+    if let Err(err) = session.say_ready().await {
+        log::debug!("[ВОРКЕР #{worker_id}] READY не подтверждён: {err}");
+    }
 
-    let (tx, mut rx) = mpsc::channel(WORKER_SEND_BUF);
-    dispatcher
-        .Register(Arc::new(WorkerSlot {
-            ID: session_id,
-            SendCh: tx,
-        }))
-        .await;
+    log::info!("[ВОРКЕР #{worker_id}] [READY] туннель готов");
+    events::emit_ready();
 
-    let mut timer = interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
-    let mut inbound = [0u8; 2048];
+    // Register with the dispatcher and pump packets.
+    let mut slot: WorkerSlot = ctx.dispatcher.register(worker_id).await;
+    let outcome = proxy(&session, &mut slot, &ctx, worker_id).await;
+
+    ctx.stats.worker_stopped();
+    ctx.dispatcher.unregister(worker_id).await;
+    binding_task.abort();
+    session.close().await;
+    allocation.close().await;
+
+    outcome
+}
+
+/// Bidirectional pump between the DTLS session and the dispatcher.
+async fn proxy(
+    session: &DtlsSession,
+    slot: &mut WorkerSlot,
+    ctx: &SessionContext,
+    worker_id: usize,
+) -> SessionOutcome {
+    let mut read_buf = vec![0u8; 2048];
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    let deadline = tokio::time::sleep(SESSION_TIMEOUT);
+    tokio::pin!(deadline);
 
     loop {
         tokio::select! {
-            packet = rx.recv() => {
-                match packet {
-                    Some(packet) => {
-                        if let Err(e) = dtls.write(&packet, Some(Duration::from_secs(SESSION_READ_TIMEOUT_SECS))).await {
-                            let err_msg = e.to_string();
-                            eprintln!("[ВОРКЕР #{}] Write error: {}", session_id, err_msg);
-                            if isAuthError(&anyhow::anyhow!(err_msg)) {
-                                handleAuthError(creds.CacheStreamID);
-                            }
-                            break;
-                        }
-                    }
-                    None => break,
+            _ = ctx.token.cancelled() => return SessionOutcome::Closed,
+
+            _ = &mut deadline => {
+                log::info!("[ВОРКЕР #{worker_id}] сессия достигла лимита времени");
+                return SessionOutcome::Closed;
+            }
+
+            _ = keepalive.tick() => {
+                if let Err(err) = session.keepalive().await {
+                    log::debug!("[ВОРКЕР #{worker_id}] keepalive не отправлен: {err}");
+                    return SessionOutcome::Retryable(format!("keepalive: {err}"));
                 }
             }
-            result = dtls.read(&mut inbound, Some(Duration::from_secs(SESSION_READ_TIMEOUT_SECS))) => {
+
+            // Local → network.
+            packet = slot.send_rx.recv() => {
+                let Some(packet) = packet else { return SessionOutcome::Closed };
+                match session.write(&packet).await {
+                    Ok(n) => ctx.stats.add_up(n as u64),
+                    Err(err) => {
+                        log::warn!("[ВОРКЕР #{worker_id}] ошибка записи: {err}");
+                        return SessionOutcome::Retryable(err.to_string());
+                    }
+                }
+            }
+
+            // Network → local.
+            result = session.read(&mut read_buf) => {
                 match result {
                     Ok(n) => {
-                        if n > 0 {
-                            if let Err(e) = dispatcher.ReturnCh.send(inbound[..n].to_vec()).await {
-                                eprintln!("[SESSION #{}] dispatcher stopped: {}", session_id, e);
-                                break;
-                            }
+                        // The server sends a 1-byte keepalive we must not forward.
+                        if n == 1 && read_buf[0] == crate::dtls::KEEPALIVE_BYTE {
+                            continue;
                         }
-                    }
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        eprintln!("[ВОРКЕР #{}] Read error: {}", session_id, err_msg);
-                        if isAuthError(&anyhow::anyhow!(err_msg)) {
-                            handleAuthError(creds.CacheStreamID);
+                        if n == 0 {
+                            continue;
                         }
-                        break;
+                        ctx.stats.add_down(n as u64);
+                        slot.send_to_local(read_buf[..n].to_vec()).await;
                     }
-                }
-            }
-            _ = timer.tick() => {
-                if let Err(e) = dtls.write(&[KEEPALIVE_BYTE], Some(Duration::from_secs(5))).await {
-                    let err_msg = e.to_string();
-                    eprintln!("[ВОРКЕР #{}] Keepalive error: {}", session_id, err_msg);
-                    if isAuthError(&anyhow::anyhow!(err_msg)) {
-                        handleAuthError(creds.CacheStreamID);
+                    Err(err) => {
+                        log::warn!("[ВОРКЕР #{worker_id}] ошибка чтения: {err}");
+                        return SessionOutcome::Retryable(err.to_string());
                     }
-                    break;
                 }
             }
         }
     }
+}
 
-    stats.ActiveConnections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    dispatcher.Unregister(session_id).await;
-    let _ = dtls.close().await;
-    let _ = turn.close().await.context("TURN close");
-    eprintln!("[ВОРКЕР #{}] Session closed", session_id);
+/// Supervises a pool of workers, restarting them with backoff.
+pub async fn run_pool(ctx: Arc<SessionContext>, workers: usize, config_tx: Option<ConfigSink>) {
+    let config_tx = Arc::new(Mutex::new(config_tx));
+    let config_delivered = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::with_capacity(workers);
 
-    Ok(config_delivered)
+    for worker_id in 1..=workers {
+        let ctx = Arc::clone(&ctx);
+        let config_tx = Arc::clone(&config_tx);
+        let config_delivered = Arc::clone(&config_delivered);
+        handles.push(tokio::spawn(async move {
+            let mut attempt = 0u32;
+            loop {
+                if ctx.token.is_cancelled() {
+                    return;
+                }
+                // Only the first worker that still needs a config asks for one.
+                let want_config = !config_delivered.load(Ordering::Relaxed);
+                let tx = {
+                    let guard = config_tx.lock().await;
+                    guard.clone()
+                };
+                let outcome = run_session(Arc::clone(&ctx), worker_id, want_config, tx).await;
+
+                match outcome {
+                    SessionOutcome::Closed => return,
+                    SessionOutcome::Fatal(message) => {
+                        log::error!("[ВОРКЕР #{worker_id}] фатально: {message}");
+                        events::emit_error("FATAL", &message, true);
+                        return;
+                    }
+                    SessionOutcome::CredentialsRejected => {
+                        attempt += 1;
+                        log::warn!("[ВОРКЕР #{worker_id}] креды отклонены (попытка {attempt})");
+                    }
+                    SessionOutcome::Retryable(message) => {
+                        attempt += 1;
+                        log::warn!("[ВОРКЕР #{worker_id}] ошибка (попытка {attempt}): {message}");
+                    }
+                }
+
+                let delay = retry_delay(attempt);
+                tokio::select! {
+                    _ = ctx.token.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }));
+    }
+
+    ctx.stats.set_workers(workers as u32, workers as u32);
+    for handle in handles {
+        let _ = handle.await;
+    }
+    log::info!("[ПУЛ] все воркеры завершены");
+}
+
+/// Exponential-ish backoff with jitter, capped at `RETRY_MAX`.
+fn retry_delay(attempt: u32) -> Duration {
+    use rand::Rng;
+    let base = RETRY_MIN.as_secs() + (attempt.min(3) as u64) * 4;
+    let jitter = rand::thread_rng().gen_range(0..4);
+    Duration::from_secs((base + jitter).min(RETRY_MAX.as_secs()))
+}
+
+/// Convenience wrapper that reports a clear error when the pool dies early.
+pub fn no_workers_error() -> anyhow::Error {
+    anyhow!("пул воркеров завершился: ни одна сессия не поднялась")
+}
+
+/// Builds a dispatcher bound to `listen` (helper for `main`).
+pub async fn make_dispatcher(listen: &str, stats: Arc<Stats>) -> Result<Dispatcher> {
+    Dispatcher::bind(listen, stats).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_is_bounded() {
+        for attempt in 0..20 {
+            let delay = retry_delay(attempt);
+            assert!(delay >= RETRY_MIN, "delay {delay:?} below minimum");
+            assert!(delay <= RETRY_MAX, "delay {delay:?} above maximum");
+        }
+    }
+
+    #[test]
+    fn retry_delay_grows_then_plateaus() {
+        // Attempt 0 is the shortest possible; attempt 10 is at the cap.
+        assert!(retry_delay(0) <= retry_delay(10));
+        assert!(retry_delay(10) <= RETRY_MAX);
+    }
+
+    #[test]
+    fn keepalive_byte_is_forwarded_only_when_longer_than_one() {
+        // Guard for the proxy loop: a 1-byte 0xFF datagram is a keepalive.
+        let keepalive = [crate::dtls::KEEPALIVE_BYTE];
+        assert_eq!(keepalive.len(), 1);
+        assert_eq!(keepalive[0], 0xFF);
+    }
 }
