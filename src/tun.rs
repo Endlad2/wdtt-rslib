@@ -157,7 +157,12 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
 }
 
 /// Один `read(2)`; `EINTR` повторяем, остальное — наверх.
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
@@ -174,7 +179,12 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
 
 /// Один `write(2)`. Для TUN каждая запись — ровно один пакет, поэтому
 /// частичную запись не «доклеиваем», а считаем ошибкой на уровне вызова.
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 fn write_fd(fd: RawFd, data: &[u8]) -> std::io::Result<usize> {
     loop {
         let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
@@ -216,7 +226,12 @@ fn register_fd(fd: OwnedTunFd) -> Result<AsyncFd<OwnedTunFd>> {
 
 /// Ждёт готовности дескриптора (`readable`/`writable`) и выполняет операцию.
 /// Ложные срабатывания (`EAGAIN`) просто повторяются.
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 async fn io_with_ready<F>(
     io: &AsyncFd<OwnedTunFd>,
     readable: bool,
@@ -503,7 +518,11 @@ fn run_command(program: &str, args: &[&str], ignore_exists: bool) -> Result<()> 
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
-    if ignore_exists && (stderr.contains("File exists") || stderr.contains("exists")) {
+    // Разные утилиты говорят по-разному (ip, route, netsh, локали).
+    let already_exists = ["File exists", "already exists", "уже существует"]
+        .iter()
+        .any(|needle| stderr.contains(needle));
+    if ignore_exists && already_exists {
         log::debug!("{program} {}: {stderr} (игнорируем)", args.join(" "));
         return Ok(());
     }
@@ -855,7 +874,18 @@ fn configure_windows(name: &str, mtu: u16, address: Ipv4Addr, prefix: u8) -> Res
 pub struct TunDevice {
     name: String,
     mtu: u16,
+    /// На прочих unix (FreeBSD и т.п.) TUN не реализован: дескриптор
+    /// принимается и удерживается, но читать/писать через него нечем.
     #[cfg(unix)]
+    #[cfg_attr(
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )),
+        allow(dead_code)
+    )]
     io: AsyncFd<OwnedTunFd>,
     #[cfg(windows)]
     wintun: wintun::Wintun,

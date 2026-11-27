@@ -34,9 +34,14 @@ tokio-util = "0.7"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli"] }
 webrtc-dtls = "0.12"
+# webrtc-dtls 0.12 works against webrtc-util 0.11; the modern turn crate
+# (0.17) against webrtc-util 0.17. Both are used under distinct aliases so the
+# two Conn traits can be implemented side by side. The ancient webrtc-turn
+# 0.1.x is avoided on purpose: it drags in nix 0.8.1, which no longer compiles
+# on macOS.
 webrtc-util = "0.11"
-webrtc-util-legacy = { package = "webrtc-util", version = "0.1" }
-webrtc-turn = "0.1"
+webrtc-util-17 = { package = "webrtc-util", version = "0.17" }
+turn = "0.17"
 boringtun = "0.7"
 async-trait = "0.1"
 socket2 = "0.5"

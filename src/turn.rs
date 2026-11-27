@@ -18,9 +18,10 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
+use turn::client::{Client, ClientConfig};
 use webrtc_util::conn::Conn as DtlsConn;
 use webrtc_util::Error as UtilError;
-use webrtc_util_legacy::conn::Conn as LegacyConn;
+use webrtc_util_17::conn::Conn as TurnConn;
 
 use crate::obfs::{self, ObfsMode, ObfsState};
 
@@ -30,51 +31,71 @@ const SOCKET_BUF_SIZE: usize = 625 * 1024;
 pub const BINDING_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Thin adapter so `tokio::net::UdpSocket` can be handed to the TURN client,
-/// which expects the older `webrtc-util` 0.1 `Conn` trait.
+/// which expects the `webrtc-util` `Conn` trait.
 struct UdpAdapter {
     socket: UdpSocket,
 }
 
 #[async_trait]
-impl webrtc_util_legacy::conn::Conn for UdpAdapter {
-    async fn connect(&self, addr: SocketAddr) -> std::io::Result<()> {
+impl TurnConn for UdpAdapter {
+    async fn connect(&self, addr: SocketAddr) -> webrtc_util_17::Result<()> {
         self.socket
             .connect(addr)
             .await
-            .map_err(std::io::Error::other)
+            .map_err(webrtc_util_17::Error::from_std)
     }
 
-    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.socket.recv(buf).await.map_err(std::io::Error::other)
+    async fn recv(&self, buf: &mut [u8]) -> webrtc_util_17::Result<usize> {
+        self.socket
+            .recv(buf)
+            .await
+            .map_err(webrtc_util_17::Error::from_std)
     }
 
-    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+    async fn recv_from(&self, buf: &mut [u8]) -> webrtc_util_17::Result<(usize, SocketAddr)> {
         self.socket
             .recv_from(buf)
             .await
-            .map_err(std::io::Error::other)
+            .map_err(webrtc_util_17::Error::from_std)
     }
 
-    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.socket.send(buf).await.map_err(std::io::Error::other)
+    async fn send(&self, buf: &[u8]) -> webrtc_util_17::Result<usize> {
+        self.socket
+            .send(buf)
+            .await
+            .map_err(webrtc_util_17::Error::from_std)
     }
 
-    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> webrtc_util_17::Result<usize> {
         self.socket
             .send_to(buf, target)
             .await
-            .map_err(std::io::Error::other)
+            .map_err(webrtc_util_17::Error::from_std)
     }
 
-    async fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.local_addr().map_err(std::io::Error::other)
+    fn local_addr(&self) -> webrtc_util_17::Result<SocketAddr> {
+        self.socket
+            .local_addr()
+            .map_err(webrtc_util_17::Error::from_std)
+    }
+
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        self.socket.peer_addr().ok()
+    }
+
+    async fn close(&self) -> webrtc_util_17::Result<()> {
+        Ok(())
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
     }
 }
 
 /// A live TURN allocation towards the WDTT server.
 pub struct TurnAllocation {
-    client: webrtc_turn::client::Client,
-    relay: Arc<dyn webrtc_util_legacy::conn::Conn + Send + Sync>,
+    client: Client,
+    relay: Arc<dyn TurnConn + Send + Sync>,
     relay_addr: SocketAddr,
     local_addr: SocketAddr,
 }
@@ -111,7 +132,7 @@ impl TurnAllocation {
             .context("local address of TURN socket")?;
         let conn = Arc::new(UdpAdapter { socket });
 
-        let client = webrtc_turn::client::Client::new(webrtc_turn::client::ClientConfig {
+        let client = Client::new(ClientConfig {
             stun_serv_addr: turn_addr.to_string(),
             turn_serv_addr: turn_addr.to_string(),
             username: username.to_string(),
@@ -137,8 +158,8 @@ impl TurnAllocation {
             .await
             .map_err(|e| anyhow!("TURN allocate: {e}"))?;
 
-        let relay_addr = LegacyConn::local_addr(&relay)
-            .await
+        let relay_addr = relay
+            .local_addr()
             .map_err(|e| anyhow!("TURN relay address: {e}"))?;
 
         Ok(TurnAllocation {
@@ -183,7 +204,7 @@ impl TurnAllocation {
 /// Minimal handle used by the keepalive task.
 #[derive(Clone)]
 pub struct TurnBindingClient {
-    client: webrtc_turn::client::Client,
+    client: Client,
 }
 
 impl TurnBindingClient {
@@ -205,7 +226,7 @@ fn set_socket_buffers(socket: &UdpSocket) {
 
 /// The DTLS-facing connection: relays through TURN and obfuscates every packet.
 pub struct TurnObfsConn {
-    relay: Arc<dyn webrtc_util_legacy::conn::Conn + Send + Sync>,
+    relay: Arc<dyn TurnConn + Send + Sync>,
     peer: SocketAddr,
     local: SocketAddr,
     wrap_key: Vec<u8>,
@@ -253,7 +274,7 @@ impl DtlsConn for TurnObfsConn {
         // something we can decrypt.
         let mut wire = vec![0u8; buf.len() + 128];
         loop {
-            let (n, addr) = LegacyConn::recv_from(&*self.relay, &mut wire)
+            let (n, addr) = TurnConn::recv_from(&*self.relay, &mut wire)
                 .await
                 .map_err(|e| util_err("relay recv", e))?;
             if n == 0 {
@@ -286,7 +307,7 @@ impl DtlsConn for TurnObfsConn {
             let mut state = self.tx.lock().await;
             obfs::wrap(&self.wrap_key, buf, &mut state).map_err(|e| util_err("obfs wrap", e))?
         };
-        LegacyConn::send_to(&*self.relay, &wrapped, self.peer)
+        TurnConn::send_to(&*self.relay, &wrapped, self.peer)
             .await
             .map_err(|e| util_err("relay send", e))?;
         Ok(buf.len())
