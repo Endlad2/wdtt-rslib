@@ -609,7 +609,7 @@ async fn fetch_with_credentials(
 
     log::info!(
         "[VK] получены TURN-креды: user={} urls={}",
-        &username,
+        username,
         urls.len()
     );
 

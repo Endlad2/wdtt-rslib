@@ -74,9 +74,8 @@ fn validate_mtu(mtu: u16) -> Result<()> {
     if mtu < MIN_MTU {
         bail!("MTU {mtu} слишком мал: минимум {MIN_MTU} байт для IPv4");
     }
-    if mtu > MAX_MTU {
-        bail!("MTU {mtu} слишком велик: максимум {MAX_MTU} байт");
-    }
+    // MAX_MTU is u16::MAX, so an upper-bound check is unreachable by
+    // construction; keep the constant for documentation and callers.
     Ok(())
 }
 
@@ -1186,14 +1185,23 @@ impl Drop for SocketPathGuard {
     }
 }
 
-/// Выравнивание управляющих сообщений: на Linux — `sizeof(size_t)`,
-/// на Darwin — 4 байта (`CMSG_ALIGN` из `<sys/socket.h>`).
+/// Выравнивание управляющих сообщений (`CMSG_ALIGN` из `<sys/socket.h>`):
+/// на Linux — `sizeof(size_t)`, на Darwin — 4 байта, на прочих unix —
+/// размер указателя.
 #[cfg(unix)]
 fn cmsg_align(len: usize) -> usize {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const ALIGN: usize = std::mem::size_of::<libc::size_t>();
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     const ALIGN: usize = 4;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    const ALIGN: usize = std::mem::size_of::<usize>();
+
     (len + ALIGN - 1) & !(ALIGN - 1)
 }
 

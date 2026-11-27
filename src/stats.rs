@@ -47,9 +47,11 @@ impl Stats {
 
     pub fn worker_stopped(&self) {
         // Saturating: a stop without a matching start must not underflow.
+        // `fetch_update` is the MSRV-compatible spelling of `try_update`.
+        #[allow(deprecated)]
         let _ = self
             .active
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             });
     }

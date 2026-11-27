@@ -103,10 +103,9 @@ pub fn normalize_vk_hash(input: &str) -> Option<String> {
 /// Parses a comma/semicolon/whitespace separated list of hashes, removing
 /// duplicates while preserving order.
 pub fn parse_hashes(raw: &str) -> Vec<String> {
+    const SEPARATORS: [char; 6] = [',', ';', '\n', '\r', '\t', ' '];
     let mut out: Vec<String> = Vec::new();
-    for part in
-        raw.split(|c: char| c == ',' || c == ';' || c == '\n' || c == '\r' || c == '\t' || c == ' ')
-    {
+    for part in raw.split(SEPARATORS) {
         if let Some(hash) = normalize_vk_hash(part) {
             if !out.iter().any(|existing| existing == &hash) {
                 out.push(hash);
