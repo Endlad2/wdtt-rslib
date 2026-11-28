@@ -2688,6 +2688,7 @@ dependencies = [
  "hkdf",
  "libc",
  "log",
+ "portable-atomic",
  "rand 0.8.8",
  "reqwest",
  "serde",

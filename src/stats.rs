@@ -2,7 +2,11 @@
 //
 //! Tunnel counters shared between workers and the status loop.
 
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+// MIPS32 и другие 32-битные цели без 64-битных атомиков: portable-atomic
+// подставляет корректную реализацию (на остальных платформах это те же
+// std-атомики без накладных расходов).
+use portable_atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// Counters for one client process.
