@@ -265,7 +265,7 @@ pub async fn run_session(
         log::debug!("[ВОРКЕР #{worker_id}] READY не подтверждён: {err}");
     }
 
-    log::info!("[ВОРКЕР #{worker_id}] [READY] туннель готов");
+    log::debug!("[ВОРКЕР #{worker_id}] [READY] туннель готов");
     events::emit_ready();
 
     // Register with the dispatcher and pump packets.

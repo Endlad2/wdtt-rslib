@@ -98,8 +98,12 @@ pub fn emit_stats(stats: &Stats) {
 }
 
 /// Signals that the tunnel can carry traffic.
+///
+/// Emitted at most once per process: every worker reaches readiness on its own,
+/// but the host application only needs the first confirmation.
 pub fn emit_ready() {
-    emit(EventKind::Ready, None);
+    static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+    ANNOUNCED.call_once(|| emit(EventKind::Ready, None));
 }
 
 /// Delivers the WireGuard config handed out by the server.

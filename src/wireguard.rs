@@ -271,6 +271,30 @@ impl WgTunnel {
         (plaintext, to_network)
     }
 
+    /// True once the peer has answered the handshake.
+    ///
+    /// boringtun reports `None` until a handshake completed, so this is the
+    /// only reliable "the tunnel really works" signal available without
+    /// injecting traffic.
+    pub fn handshake_complete(&self) -> bool {
+        self.tunn.time_since_last_handshake().is_some()
+    }
+
+    /// `TUNCONF:<address>:<dns>` — the same line the reference clients print
+    /// so a host application can configure its own interface (Android/iOS
+    /// VpnService, Desktop).
+    pub fn tunconf_line(&self) -> String {
+        let addr = self.local_v4.to_string();
+        let dns = self
+            .config
+            .dns
+            .as_deref()
+            .map(|d| d.replace(' ', ""))
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| "1.1.1.1".to_string());
+        format!("TUNCONF:{addr}:{dns}")
+    }
+
     /// Drives the WireGuard timers; returns datagrams to send.
     pub fn update_timers(&mut self) -> Vec<Vec<u8>> {
         let mut out = vec![0u8; MAX_PACKET];

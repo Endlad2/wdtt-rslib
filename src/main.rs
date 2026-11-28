@@ -98,6 +98,14 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub tun_fd_socket: Option<String>,
 
+    /// Отдавать сырые IP-пакеты по UDP вместо TUN (Android VpnService, iOS)
+    ///
+    /// Ядро слушает этот адрес: хост-приложение присылает сюда IP-пакеты из
+    /// своего интерфейса, а ядро само делает WireGuard. Это единственный
+    /// способ работать на Android без root: /dev/net/tun там недоступен.
+    #[arg(long, value_name = "ADDR")]
+    pub packet_port: Option<String>,
+
     /// Печатать машинные события __WDTT_EVENT__|...
     #[arg(long)]
     pub events: bool,
@@ -322,6 +330,9 @@ async fn run(args: Args) -> Result<()> {
         tunnel.local_v4,
         wg_config.mtu
     );
+    // Host applications parse this line to bring up their own interface when
+    // the core runs with --no-tun (Android VpnService, iOS, Desktop).
+    log::info!("{}", tunnel.tunconf_line());
 
     stats.mark_connected(now_millis());
 
@@ -329,6 +340,8 @@ async fn run(args: Args) -> Result<()> {
     let tun_mode = if args.self_test {
         // The self-test talks to the tunnel directly, so no interface is needed.
         TunMode::None
+    } else if let Some(addr) = &args.packet_port {
+        TunMode::Packet(addr.clone())
     } else if args.no_tun {
         TunMode::None
     } else if let Some(path) = &args.tun_fd_socket {
@@ -339,7 +352,7 @@ async fn run(args: Args) -> Result<()> {
 
     let mtu = args.mtu.unwrap_or(wg_config.mtu);
     let tun = match &tun_mode {
-        TunMode::None => None,
+        TunMode::None | TunMode::Packet(_) => None,
         TunMode::Own(name) => {
             let device = wdtt_rslib::tun::TunDevice::create(name, mtu)
                 .with_context(|| format!("создание TUN {name}"))?;
@@ -373,20 +386,44 @@ async fn run(args: Args) -> Result<()> {
         return run_self_test(tunnel, dispatcher.local_addr(), token.clone()).await;
     }
 
-    // WireGuard pump: TUN ↔ WireGuard ↔ local endpoint ↔ sessions.
+    // WireGuard pump: TUN (or host packets) ↔ WireGuard ↔ local endpoint.
     let pump = match tun {
         Some(tun) => {
             let endpoint = dispatcher.local_addr();
-            let pump = WgPump::new(tunnel, tun, endpoint).await?;
+            let pump = WgPump::new(tunnel, PumpIo::Tun(tun), endpoint).await?;
             let pump_token = token.clone();
             Some(tokio::spawn(async move { pump.run(pump_token).await }))
         }
         None => {
-            log::info!(
-                "[TUN] режим без интерфейса: WireGuard-эндпоинт {}",
-                dispatcher.local_addr()
-            );
-            None
+            if let TunMode::Packet(addr) = &tun_mode {
+                // Raw IP packets from the host application (Android VpnService).
+                let socket = tokio::net::UdpSocket::bind(addr)
+                    .await
+                    .with_context(|| format!("пакетный сокет {addr}"))?;
+                let local = socket.local_addr().context("адрес пакетного сокета")?;
+                log::info!(
+                    "[PACKET] сырые IP-пакеты на {local}, WireGuard-эндпоинт {}",
+                    dispatcher.local_addr()
+                );
+                let endpoint = dispatcher.local_addr();
+                let pump =
+                    WgPump::new(tunnel, PumpIo::Packet { socket, peer: None }, endpoint).await?;
+                let pump_token = token.clone();
+                Some(tokio::spawn(async move { pump.run(pump_token).await }))
+            } else {
+                log::info!(
+                    "[TUN] режим без интерфейса: WireGuard-эндпоинт {}",
+                    dispatcher.local_addr()
+                );
+                // WireGuard is driven by the host application in this mode, so the
+                // best readiness signal we can give is an established worker pool.
+                let ready_token = token.clone();
+                let ready_stats = Arc::clone(&stats);
+                tokio::spawn(async move {
+                    wait_for_workers(&ready_token, &ready_stats).await;
+                });
+                None
+            }
         }
     };
 
@@ -416,6 +453,8 @@ enum TunMode {
     ExternalFd(String),
     /// No interface: the host runs WireGuard itself.
     None,
+    /// No interface: raw IP packets arrive over UDP from the host application.
+    Packet(String),
 }
 
 /// Pumps packets between the TUN device and the local WireGuard endpoint.
@@ -426,17 +465,29 @@ enum TunMode {
 /// in-process.
 struct WgPump {
     tunnel: WgTunnel,
-    tun: wdtt_rslib::tun::TunDevice,
+    /// Where plaintext IP packets come from and go to.
+    io: PumpIo,
     /// Socket towards the local endpoint owned by the dispatcher.
     socket: tokio::net::UdpSocket,
 }
 
+/// Source and sink of plaintext IP packets.
+enum PumpIo {
+    /// A real TUN interface.
+    Tun(wdtt_rslib::tun::TunDevice),
+    /// A UDP socket owned by the host application (Android VpnService, iOS).
+    ///
+    /// The host sends raw IP packets here and receives them back from the same
+    /// address; the core never needs /dev/net/tun, which Android forbids.
+    Packet {
+        socket: tokio::net::UdpSocket,
+        /// Last peer that sent a packet, used as the reply destination.
+        peer: Option<std::net::SocketAddr>,
+    },
+}
+
 impl WgPump {
-    async fn new(
-        tunnel: WgTunnel,
-        tun: wdtt_rslib::tun::TunDevice,
-        endpoint: std::net::SocketAddr,
-    ) -> Result<Self> {
+    async fn new(tunnel: WgTunnel, io: PumpIo, endpoint: std::net::SocketAddr) -> Result<Self> {
         let socket = tokio::net::UdpSocket::bind(if endpoint.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -448,11 +499,23 @@ impl WgPump {
             .connect(endpoint)
             .await
             .with_context(|| format!("подключение к локальному эндпоинту {endpoint}"))?;
-        Ok(WgPump {
-            tunnel,
-            tun,
-            socket,
-        })
+        Ok(WgPump { tunnel, io, socket })
+    }
+
+    /// Writes one plaintext IP packet back to the host.
+    async fn write_packet(&mut self, packet: &[u8]) -> Result<()> {
+        match &mut self.io {
+            PumpIo::Tun(tun) => tun.write(packet).await.map(|_| ()).context("запись TUN"),
+            PumpIo::Packet { socket, peer } => {
+                if let Some(addr) = *peer {
+                    socket
+                        .send_to(packet, addr)
+                        .await
+                        .context("отправка пакета хосту")?;
+                }
+                Ok(())
+            }
+        }
     }
 
     async fn send(&self, datagram: &[u8]) -> Result<()> {
@@ -467,6 +530,7 @@ impl WgPump {
         let mut tun_buf = vec![0u8; wireguard::MAX_PACKET];
         let mut net_buf = vec![0u8; wireguard::MAX_PACKET];
         let mut timer = tokio::time::interval(Duration::from_millis(250));
+        let mut ready = false;
 
         loop {
             tokio::select! {
@@ -478,19 +542,26 @@ impl WgPump {
                             log::debug!("[WG] таймер: {err}");
                         }
                     }
+                    // A completed handshake is the real proof that the tunnel
+                    // works: sessions may be up while WireGuard is still down.
+                    if !ready && self.tunnel.handshake_complete() {
+                        ready = true;
+                        log::info!("[READY] туннель готов");
+                        events::emit_ready();
+                    }
                 }
 
-                // Outgoing: TUN → WireGuard → local endpoint.
-                result = self.tun.read(&mut tun_buf) => {
-                    match result {
-                        Ok(n) if n > 0 => {
-                            if let Some(datagram) = self.tunnel.encapsulate(&tun_buf[..n]) {
-                                if let Err(err) = self.send(&datagram).await {
-                                    log::debug!("[WG] отправка: {err}");
-                                }
+                // Outgoing: host packets → WireGuard → local endpoint.
+                // The datagram is computed inside the branch so the mutable
+                // borrow of `self.io` ends before `self.send()` runs.
+                datagram = read_and_encapsulate(&mut self.io, &mut self.tunnel, &mut tun_buf) => {
+                    match datagram {
+                        Ok(Some(datagram)) => {
+                            if let Err(err) = self.send(&datagram).await {
+                                log::debug!("[WG] отправка: {err}");
                             }
                         }
-                        Ok(_) => {}
+                        Ok(None) => {}
                         Err(err) => {
                             log::debug!("[TUN] чтение: {err}");
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -509,7 +580,7 @@ impl WgPump {
                                 }
                             }
                             if let Some(packet) = plaintext {
-                                if let Err(err) = self.tun.write(&packet).await {
+                                if let Err(err) = self.write_packet(&packet).await {
                                     log::debug!("[TUN] запись: {err}");
                                 }
                             }
@@ -520,6 +591,53 @@ impl WgPump {
                             tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Reads one packet from the host side and encapsulates it.
+///
+/// Kept as a free function so the mutable borrow of the pump's I/O ends before
+/// the caller sends the datagram, which needs `&self`.
+async fn read_and_encapsulate(
+    io: &mut PumpIo,
+    tunnel: &mut WgTunnel,
+    buf: &mut [u8],
+) -> Result<Option<Vec<u8>>> {
+    let n = match io {
+        PumpIo::Tun(tun) => tun.read(buf).await.context("чтение TUN")?,
+        PumpIo::Packet { socket, peer } => {
+            let (n, from) = socket
+                .recv_from(buf)
+                .await
+                .context("чтение пакета от хоста")?;
+            *peer = Some(from);
+            n
+        }
+    };
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(tunnel.encapsulate(&buf[..n]))
+}
+
+/// Waits until the worker pool reports at least one live session, then
+/// announces readiness.
+///
+/// Used in `--no-tun` mode, where the WireGuard pump lives in the host
+/// application and this process cannot watch the handshake itself.
+async fn wait_for_workers(token: &CancellationToken, stats: &Stats) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = ticker.tick() => {
+                if stats.active() > 0 {
+                    log::info!("[READY] туннель готов");
+                    events::emit_ready();
+                    return;
                 }
             }
         }
@@ -728,6 +846,7 @@ mod tests {
         assert_eq!(args.obfs, "audio");
         assert_eq!(args.tun_name, "wdtt0");
         assert!(!args.no_tun);
+        assert!(args.packet_port.is_none());
         assert!(!args.events);
     }
 }

@@ -261,10 +261,25 @@ fn set_buffers(socket: &UdpSocket) {
 }
 
 /// Total traffic formatted for logs.
+/// Formats the periodic statistics line.
+///
+/// The wording matches the reference client byte for byte
+/// (`[СТАТИСТИКА] Активных: N | Трафик: X.XX МБ`), because host applications
+/// parse it to decide whether the tunnel is up. The detailed per-direction
+/// numbers are kept for the structured events.
 pub fn traffic_summary(stats: &Stats) -> String {
+    let total = stats.bytes_up().saturating_add(stats.bytes_down());
     format!(
-        "активных: {} | отправлено: {} | получено: {}",
+        "Активных: {} | Трафик: {:.2} МБ",
         stats.active(),
+        total as f64 / (1024.0 * 1024.0)
+    )
+}
+
+/// Detailed line for the log at debug level.
+pub fn traffic_detail(stats: &Stats) -> String {
+    format!(
+        "отправлено: {} | получено: {}",
         crate::stats::format_mb(stats.bytes_up()),
         crate::stats::format_mb(stats.bytes_down())
     )
@@ -285,6 +300,7 @@ pub async fn stats_loop(stats: Arc<Stats>, token: tokio_util::sync::Cancellation
                 last_up = up;
                 last_down = down;
                 log::info!("[СТАТИСТИКА] {}", traffic_summary(&stats));
+                log::debug!("[СТАТИСТИКА] {}", traffic_detail(&stats));
                 crate::events::emit_stats(&stats);
             }
         }
